@@ -1,0 +1,32 @@
+config:
+  target: "ws://localhost:8080"
+  phases:
+    # Phase 1: Warm up the CPU and Redis (30 seconds)
+    - duration: 30
+      arrivalRate: 50
+      name: "Warm up"
+      
+    # Phase 2: The Attack - Ramp from 50 to 500 users per second (60 seconds)
+    - duration: 60
+      arrivalRate: 50
+      rampTo: 500
+      name: "Ramping up to breaking point"
+      
+    # Phase 3: The Crucible - Sustain 500 users per second (60 seconds)
+    - duration: 60
+      arrivalRate: 500
+      name: "Sustained massive load"
+      
+  ws:
+    rejectUnauthorized: false
+
+scenarios:
+  - name: "User connects, finds match, sends message, and leaves"
+    engine: ws
+    flow:
+      - connect: "{{ target }}"
+      - think: 1
+      - send: '{"action": "find_match", "userId": "load_test_user_{{ $randomString() }}"}'
+      - think: 2 
+      - send: '{"action": "send", "text": "Stress test incoming!"}'
+      - think: 5
