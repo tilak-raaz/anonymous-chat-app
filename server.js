@@ -1,3 +1,4 @@
+const { randomUUID } = require("crypto");
 const { WebSocketServer } = require("ws");
 const { createClient } = require("redis");
 const config = require("./config");
@@ -18,6 +19,32 @@ function sendJson(ws, payload) {
 
 function sendError(ws, text) {
   sendJson(ws, { system: true, action: "error", text });
+}
+
+/**
+ * Room channels carry the sender's internal session id. It must never reach a
+ * browser: whoever learns it could impersonate that user. So every chat
+ * message is rewritten per recipient to `from: "me" | "stranger"`.
+ */
+function deliverRoomMessage(clients, rawMsg) {
+  let msg;
+  try {
+    msg = JSON.parse(rawMsg);
+  } catch {
+    return console.error("Ignoring malformed room message:", rawMsg);
+  }
+
+  clients.forEach((client) => {
+    if (client.readyState !== 1) return;
+    if (msg.system) return client.send(rawMsg);
+
+    sendJson(client, {
+      id: msg.id,
+      from: msg.from === client.sessionId ? "me" : "stranger",
+      text: msg.text,
+      ts: msg.ts,
+    });
+  });
 }
 
 async function startServer() {
@@ -54,11 +81,7 @@ async function startServer() {
 
         subscriber.subscribe(event.roomId, (chatMsg) => {
           const clientsInRoom = localRooms.get(event.roomId);
-          if (clientsInRoom) {
-            clientsInRoom.forEach((client) => {
-              if (client.readyState === 1) client.send(chatMsg);
-            });
-          }
+          if (clientsInRoom) deliverRoomMessage(clientsInRoom, chatMsg);
         });
       }
 
@@ -69,14 +92,18 @@ async function startServer() {
         JSON.stringify({
           system: true,
           action: "matched",
-          text: `match found you are in ${event.roomId}`,
+          text: "You are now chatting with a stranger. Say hi!",
         }),
       );
     }
   });
 
   wss.on("connection", (ws) => {
-    let myUserId = null;
+    // Identity is decided by the server, never by the client. A client-chosen
+    // id could be set to someone else's id to hijack their match.
+    const myUserId = randomUUID();
+    ws.sessionId = myUserId;
+    localUsers.set(myUserId, ws);
     const allowPacket = createRateLimiter(
       config.RATE_LIMIT_MAX,
       config.RATE_LIMIT_WINDOW_MS,
@@ -98,12 +125,6 @@ async function startServer() {
         const packet = parsed.packet;
 
         if (packet.action === "find_match") {
-          if (typeof packet.userId !== "string" || !packet.userId) {
-            return sendError(ws, "Missing userId.");
-          }
-          myUserId = packet.userId;
-          localUsers.set(myUserId, ws);
-
           if (ws.currentRoom && localRooms.has(ws.currentRoom)) {
             const oldRoomSet = localRooms.get(ws.currentRoom);
             oldRoomSet.delete(ws);
@@ -143,8 +164,10 @@ async function startServer() {
           await publisher.publish(
             ws.currentRoom,
             JSON.stringify({
+              id: randomUUID(),
               from: myUserId,
               text: packet.text,
+              ts: Date.now(),
             }),
           );
           await publisher.xAdd("chat_history_log", "*", {
@@ -160,33 +183,31 @@ async function startServer() {
     });
 
     ws.on("close", async () => {
-      console.log(` [${SERVER_ID}] ${myUserId || "unknown"} disconnected.`);
+      console.log(` [${SERVER_ID}] ${myUserId} disconnected.`);
 
       try {
-        if (myUserId) {
-          localUsers.delete(myUserId);
-          await publisher.del(`route:${myUserId}`);
+        localUsers.delete(myUserId);
+        await publisher.del(`route:${myUserId}`);
 
-          if (!ws.currentRoom) {
-            await publisher.zRem("waiting_pool", myUserId);
-          } else {
-            await publisher.publish(
-              ws.currentRoom,
-              JSON.stringify({
-                system: true,
-                action: "partner_left",
-                text: "Stranger has disconnected.",
-              }),
-            );
+        if (!ws.currentRoom) {
+          await publisher.zRem("waiting_pool", myUserId);
+        } else {
+          await publisher.publish(
+            ws.currentRoom,
+            JSON.stringify({
+              system: true,
+              action: "partner_left",
+              text: "Stranger has disconnected.",
+            }),
+          );
 
-            if (localRooms.has(ws.currentRoom)) {
-              const roomSet = localRooms.get(ws.currentRoom);
-              roomSet.delete(ws);
-              if (roomSet.size === 0) {
-                localRooms.delete(ws.currentRoom);
-                await subscriber.unsubscribe(ws.currentRoom);
-                console.log(` unsubscribed from dead room: ${ws.currentRoom}`);
-              }
+          if (localRooms.has(ws.currentRoom)) {
+            const roomSet = localRooms.get(ws.currentRoom);
+            roomSet.delete(ws);
+            if (roomSet.size === 0) {
+              localRooms.delete(ws.currentRoom);
+              await subscriber.unsubscribe(ws.currentRoom);
+              console.log(` unsubscribed from dead room: ${ws.currentRoom}`);
             }
           }
         }
