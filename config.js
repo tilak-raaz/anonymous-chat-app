@@ -22,6 +22,13 @@ module.exports = {
   HEARTBEAT_INTERVAL_MS: int("HEARTBEAT_INTERVAL_MS", 30_000),
   ROUTE_TTL_SECONDS: int("ROUTE_TTL_SECONDS", 90),
 
+  // Upper bound on chat_history_log entries kept in Redis memory
+  STREAM_MAX_LENGTH: int("STREAM_MAX_LENGTH", 100_000),
+
+  // Worker: take over entries a crashed worker left un-acked
+  WORKER_CLAIM_IDLE_MS: int("WORKER_CLAIM_IDLE_MS", 60_000),
+  WORKER_CLAIM_INTERVAL_MS: int("WORKER_CLAIM_INTERVAL_MS", 30_000),
+
   DB: {
     host: process.env.DB_HOST || "postgres",
     port: int("DB_PORT", 5432),

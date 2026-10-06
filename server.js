@@ -297,11 +297,24 @@ async function startServer() {
           ts: Date.now(),
         }),
       );
-      await publisher.xAdd("chat_history_log", "*", {
-        roomId: ws.currentRoom,
-        userId: ws.sessionId,
-        text: packet.text,
-      });
+      await publisher.xAdd(
+        "chat_history_log",
+        "*",
+        {
+          roomId: ws.currentRoom,
+          userId: ws.sessionId,
+          text: packet.text,
+        },
+        // Cap the stream's memory. "~" lets Redis trim in cheap whole-node
+        // steps. Only matters if the worker falls this far behind.
+        {
+          TRIM: {
+            strategy: "MAXLEN",
+            strategyModifier: "~",
+            threshold: config.STREAM_MAX_LENGTH,
+          },
+        },
+      );
     },
 
     async typing(ws) {
