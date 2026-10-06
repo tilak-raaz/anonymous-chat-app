@@ -1,0 +1,8 @@
+# Keep the build context small and never copy host-built node_modules
+# (they may contain macOS binaries) into the Linux image.
+node_modules
+.git
+.vscode
+public
+*.md
+dump.rdb

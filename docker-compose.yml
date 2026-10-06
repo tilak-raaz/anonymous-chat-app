@@ -1,60 +1,96 @@
-version: '3.8'
+# Shared settings for every Node service (read by config.js)
+x-app-env: &app-env
+  REDIS_URL: redis://redis:6379
+  MATCHMAKER_URL: http://matchmaker:3001
+  DB_HOST: postgres
+  DB_USER: ${POSTGRES_USER:-postgres}
+  DB_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+  DB_NAME: anonymous_db
 
 services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: anonymous_db
     ports:
-      - "5432:5432"
+      # Bound to localhost: on a public server "5432:5432" exposes the
+      # database to the internet (Docker bypasses ufw/iptables rules).
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data # survive `docker compose down`
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d anonymous_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: always
+
   redis:
     image: redis:alpine
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379" # same reason: Redis has no password here
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: always
 
   matchmaker:
     build: .
     command: node matchmaker.js
-    ports:
-      - "3001:3001"
+    environment: *app-env
+    # No published port: only the chat nodes may call it. A public
+    # /find-match would let anyone register fake users and routes.
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: always
 
   worker:
     build: .
     command: node worker.js
+    environment: *app-env
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: always
 
   node_a:
     build: .
     command: node server.js 8081
+    environment: *app-env
     depends_on:
-      - redis
-      - matchmaker
+      redis:
+        condition: service_healthy
+      matchmaker:
+        condition: service_started
     restart: always
 
   node_b:
     build: .
     command: node server.js 8082
+    environment: *app-env
     depends_on:
-      - redis
-      - matchmaker
+      redis:
+        condition: service_healthy
+      matchmaker:
+        condition: service_started
     restart: always
 
   node_c:
     build: .
     command: node server.js 8083
+    environment: *app-env
     depends_on:
-      - redis
-      - matchmaker
+      redis:
+        condition: service_healthy
+      matchmaker:
+        condition: service_started
     restart: always
 
   loadbalancer:
@@ -67,3 +103,6 @@ services:
       - node_b
       - node_c
     restart: always
+
+volumes:
+  pgdata:
