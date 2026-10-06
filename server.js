@@ -202,6 +202,61 @@ async function startServer() {
     }
   });
 
+  // ------------------------------------------------------------ heartbeat
+
+  /**
+   * Every HEARTBEAT_INTERVAL_MS:
+   *  1. Ping every socket; one that didn't answer the previous ping is a dead
+   *     TCP connection (closed laptop, lost network) and gets terminated,
+   *     which runs the normal close cleanup.
+   *  2. Refresh route keys of our users (one pipelined round trip).
+   *  3. For users in a chat, check the partner's route key still exists. If
+   *     it expired, the partner's node crashed and nobody will ever send us
+   *     "left", so we end the chat ourselves.
+   */
+  async function heartbeat() {
+    const chatting = [];
+    const refresh = publisher.multi();
+    let refreshed = 0;
+
+    for (const ws of localUsers.values()) {
+      if (ws.isAlive === false) {
+        console.log(` [${SERVER_ID}] ${ws.sessionId} missed a heartbeat, dropping.`);
+        ws.terminate();
+        continue;
+      }
+      ws.isAlive = false;
+      ws.ping();
+      refresh.expire(`route:${ws.sessionId}`, config.ROUTE_TTL_SECONDS);
+      refreshed += 1;
+      if (ws.state === "chatting" && ws.partnerId) chatting.push(ws);
+    }
+
+    if (refreshed > 0) await refresh.execAsPipeline();
+    if (chatting.length === 0) return;
+
+    const probe = publisher.multi();
+    chatting.forEach((ws) => probe.exists(`route:${ws.partnerId}`));
+    const alive = await probe.execAsPipeline();
+
+    chatting.forEach((ws, i) => {
+      if (alive[i] || ws.state !== "chatting") return;
+      const roomId = ws.currentRoom;
+      console.log(` [${SERVER_ID}] partner of ${ws.sessionId} vanished, closing ${roomId}`);
+      ws.state = "idle";
+      ws.currentRoom = null;
+      ws.partnerId = null;
+      detachFromRoom(ws, roomId);
+      sendSystem(ws, "partner_left", "Stranger has disconnected.");
+      closeRoom(roomId, ws.sessionId).catch(() => {});
+    });
+  }
+
+  const heartbeatTimer = setInterval(() => {
+    heartbeat().catch((err) => console.error(` [${SERVER_ID}] Heartbeat failed:`, err));
+  }, config.HEARTBEAT_INTERVAL_MS);
+  wss.on("close", () => clearInterval(heartbeatTimer));
+
   // -------------------------------------------------------------- sockets
 
   const handlers = {
@@ -266,6 +321,10 @@ async function startServer() {
     ws.state = "idle"; // idle -> searching -> chatting -> idle
     ws.currentRoom = null;
     ws.partnerId = null;
+    ws.isAlive = true;
+    ws.on("pong", () => {
+      ws.isAlive = true;
+    });
     localUsers.set(ws.sessionId, ws);
 
     const allowPacket = createRateLimiter(

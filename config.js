@@ -17,6 +17,11 @@ module.exports = {
   RATE_LIMIT_MAX: int("RATE_LIMIT_MAX", 20), // packets...
   RATE_LIMIT_WINDOW_MS: int("RATE_LIMIT_WINDOW_MS", 10_000), // ...per window
 
+  // Liveness. Sockets that miss a pong are dropped; route keys of users on a
+  // node that crashed expire on their own because nobody refreshes them.
+  HEARTBEAT_INTERVAL_MS: int("HEARTBEAT_INTERVAL_MS", 30_000),
+  ROUTE_TTL_SECONDS: int("ROUTE_TTL_SECONDS", 90),
+
   DB: {
     host: process.env.DB_HOST || "postgres",
     port: int("DB_PORT", 5432),

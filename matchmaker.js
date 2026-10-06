@@ -74,7 +74,11 @@ async function startMatchmaker() {
     }
 
     try {
-      await redis.set(`${ROUTE_PREFIX}${userId}`, serverId);
+      // The chat node refreshes this TTL on every heartbeat. If the node dies,
+      // the key expires and the Lua script treats the user as a ghost.
+      await redis.set(`${ROUTE_PREFIX}${userId}`, serverId, {
+        EX: config.ROUTE_TTL_SECONDS,
+      });
 
       const pair = await redis.eval(MATCH_SCRIPT, {
         keys: [WAITING_POOL],
