@@ -154,6 +154,8 @@ async function startServer() {
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
           } catch (err) {
             console.error("failed to contact Matchmaker API:", err.message);
+            // We might already be queued; don't leave a half-registered user behind.
+            await publisher.zRem("waiting_pool", myUserId).catch(() => {});
             sendError(ws, "Matchmaking is unavailable right now. Try again.");
           }
         }
