@@ -7,6 +7,9 @@ const { parsePacket, createRateLimiter } = require("./protocol");
 const PORT = Number(process.argv[2] || 8081);
 const SERVER_ID = `server_events_${PORT}`;
 const MATCHMAKER_URL = `${config.MATCHMAKER_URL}/find-match`;
+const WAITING_POOL = "waiting_pool";
+// Marks a room as finished so a late joiner doesn't sit in a dead room.
+const ROOM_CLOSED_TTL_SECONDS = 600;
 
 // A bug in one handler must never take the whole node (and every socket on it) down.
 process.on("unhandledRejection", (err) => {
@@ -17,34 +20,12 @@ function sendJson(ws, payload) {
   if (ws.readyState === 1) ws.send(JSON.stringify(payload));
 }
 
-function sendError(ws, text) {
-  sendJson(ws, { system: true, action: "error", text });
+function sendSystem(ws, action, text) {
+  sendJson(ws, { system: true, action, text });
 }
 
-/**
- * Room channels carry the sender's internal session id. It must never reach a
- * browser: whoever learns it could impersonate that user. So every chat
- * message is rewritten per recipient to `from: "me" | "stranger"`.
- */
-function deliverRoomMessage(clients, rawMsg) {
-  let msg;
-  try {
-    msg = JSON.parse(rawMsg);
-  } catch {
-    return console.error("Ignoring malformed room message:", rawMsg);
-  }
-
-  clients.forEach((client) => {
-    if (client.readyState !== 1) return;
-    if (msg.system) return client.send(rawMsg);
-
-    sendJson(client, {
-      id: msg.id,
-      from: msg.from === client.sessionId ? "me" : "stranger",
-      text: msg.text,
-      ts: msg.ts,
-    });
-  });
+function sendError(ws, text) {
+  sendSystem(ws, "error", text);
 }
 
 async function startServer() {
@@ -63,8 +44,149 @@ async function startServer() {
     maxPayload: config.MAX_PAYLOAD_BYTES,
   });
 
+  /**
+   * roomId -> { clients: Set<ws>, ready: Promise }
+   * `ready` resolves once Redis has confirmed the SUBSCRIBE, so nothing that
+   * is published to the room after that point can be missed.
+   */
   const localRooms = new Map();
+  /** sessionId -> ws, for every socket connected to this node */
   const localUsers = new Map();
+
+  // ---------------------------------------------------------------- rooms
+
+  /**
+   * Room channels carry the sender's internal session id. It must never reach
+   * a browser: whoever learns it could impersonate that user. So every event
+   * is rewritten per recipient (`from: "me" | "stranger"`).
+   */
+  function handleRoomEvent(roomId, rawEvent) {
+    const room = localRooms.get(roomId);
+    if (!room) return;
+
+    let event;
+    try {
+      event = JSON.parse(rawEvent);
+    } catch {
+      return console.error("Ignoring malformed room event:", rawEvent);
+    }
+
+    for (const client of [...room.clients]) {
+      const isSender = event.from === client.sessionId;
+
+      if (event.kind === "chat") {
+        sendJson(client, {
+          id: event.id,
+          from: isSender ? "me" : "stranger",
+          text: event.text,
+          ts: event.ts,
+        });
+      } else if (event.kind === "typing" && !isSender) {
+        sendJson(client, { action: "typing" });
+      } else if (event.kind === "left" && !isSender) {
+        // Our partner is gone: free this socket so it can't keep sending
+        // messages into a dead room.
+        client.state = "idle";
+        client.currentRoom = null;
+        client.partnerId = null;
+        detachFromRoom(client, roomId);
+        sendSystem(client, "partner_left", "Stranger has disconnected.");
+      }
+    }
+  }
+
+  async function attachToRoom(ws, roomId) {
+    let room = localRooms.get(roomId);
+    if (!room) {
+      room = { clients: new Set(), ready: null };
+      room.ready = subscriber.subscribe(roomId, (raw) =>
+        handleRoomEvent(roomId, raw),
+      );
+      localRooms.set(roomId, room);
+    }
+    room.clients.add(ws);
+    await room.ready;
+  }
+
+  function detachFromRoom(ws, roomId) {
+    const room = localRooms.get(roomId);
+    if (!room) return;
+    room.clients.delete(ws);
+    if (room.clients.size === 0) {
+      localRooms.delete(roomId);
+      subscriber
+        .unsubscribe(roomId)
+        .then(() => console.log(` unsubscribed from finished room: ${roomId}`))
+        .catch((err) => console.error("Unsubscribe failed:", err));
+    }
+  }
+
+  /** Close a room on behalf of `userId` and tell the other side. */
+  async function closeRoom(roomId, userId) {
+    // Set the marker first: a partner whose join is still in flight will see
+    // it, and a partner that already joined will get the publish below.
+    await publisher.set(`room_closed:${roomId}`, "1", {
+      EX: ROOM_CLOSED_TTL_SECONDS,
+    });
+    await publisher.publish(roomId, JSON.stringify({ kind: "left", from: userId }));
+  }
+
+  async function leaveRoom(ws) {
+    const roomId = ws.currentRoom;
+    if (!roomId) return;
+    ws.state = "idle";
+    ws.currentRoom = null;
+    ws.partnerId = null;
+    await closeRoom(roomId, ws.sessionId);
+    detachFromRoom(ws, roomId);
+  }
+
+  // ---------------------------------------------------------- matchmaking
+
+  async function requestMatch(ws) {
+    try {
+      const response = await fetch(MATCHMAKER_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId: ws.sessionId, serverId: SERVER_ID }),
+        signal: AbortSignal.timeout(config.MATCHMAKER_TIMEOUT_MS),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    } catch (err) {
+      console.error("failed to contact Matchmaker API:", err.message);
+      // We might already be queued; don't leave a half-registered user behind.
+      await publisher.zRem(WAITING_POOL, ws.sessionId).catch(() => {});
+      if (ws.state === "searching") ws.state = "idle";
+      sendError(ws, "Matchmaking is unavailable right now. Try again.");
+    }
+  }
+
+  async function handleMatched({ userId, partnerId, roomId }) {
+    const ws = localUsers.get(userId);
+
+    // The user disconnected, cancelled or skipped while the match was being
+    // made. Decline it so the partner isn't left waiting in an empty room.
+    if (!ws || ws.readyState !== 1 || ws.state !== "searching") {
+      return closeRoom(roomId, userId);
+    }
+
+    ws.state = "chatting";
+    ws.currentRoom = roomId;
+    ws.partnerId = partnerId;
+    await attachToRoom(ws, roomId);
+
+    if (await publisher.exists(`room_closed:${roomId}`)) {
+      // Partner was gone before we even arrived: quietly search again
+      // instead of showing "matched" followed by "disconnected".
+      detachFromRoom(ws, roomId);
+      ws.currentRoom = null;
+      ws.partnerId = null;
+      ws.state = "searching";
+      return requestMatch(ws);
+    }
+
+    sendSystem(ws, "matched", "You are now chatting with a stranger. Say hi!");
+  }
 
   await subscriber.subscribe(SERVER_ID, (eventStr) => {
     let event;
@@ -73,37 +195,79 @@ async function startServer() {
     } catch {
       return console.error("Ignoring malformed server event:", eventStr);
     }
-    const targetSocket = localUsers.get(event.userId);
-
-    if (targetSocket && targetSocket.readyState === 1) {
-      if (!localRooms.has(event.roomId)) {
-        localRooms.set(event.roomId, new Set());
-
-        subscriber.subscribe(event.roomId, (chatMsg) => {
-          const clientsInRoom = localRooms.get(event.roomId);
-          if (clientsInRoom) deliverRoomMessage(clientsInRoom, chatMsg);
-        });
-      }
-
-      localRooms.get(event.roomId).add(targetSocket);
-      targetSocket.currentRoom = event.roomId;
-
-      targetSocket.send(
-        JSON.stringify({
-          system: true,
-          action: "matched",
-          text: "You are now chatting with a stranger. Say hi!",
-        }),
+    if (event.type === "matched") {
+      handleMatched(event).catch((err) =>
+        console.error(` [${SERVER_ID}] Failed to handle match:`, err),
       );
     }
   });
 
+  // -------------------------------------------------------------- sockets
+
+  const handlers = {
+    async find_match(ws) {
+      if (ws.state === "searching") return; // double click: already queued
+      if (ws.state === "chatting") await leaveRoom(ws); // "next stranger"
+
+      ws.state = "searching";
+      sendSystem(ws, "searching", "Searching for a stranger");
+      await requestMatch(ws);
+    },
+
+    async cancel_search(ws) {
+      if (ws.state !== "searching") return;
+      ws.state = "idle";
+      // If a match is already in flight, handleMatched() sees state "idle"
+      // and declines it, so cancelling is always safe.
+      await publisher.zRem(WAITING_POOL, ws.sessionId);
+      sendSystem(ws, "search_cancelled", "Stopped searching.");
+    },
+
+    async leave(ws) {
+      if (ws.state !== "chatting") return;
+      await leaveRoom(ws);
+      sendSystem(ws, "left", "You left the chat.");
+    },
+
+    async send(ws, packet) {
+      if (ws.state !== "chatting") return sendError(ws, "You are not in a chat.");
+
+      await publisher.publish(
+        ws.currentRoom,
+        JSON.stringify({
+          kind: "chat",
+          id: randomUUID(),
+          from: ws.sessionId,
+          text: packet.text,
+          ts: Date.now(),
+        }),
+      );
+      await publisher.xAdd("chat_history_log", "*", {
+        roomId: ws.currentRoom,
+        userId: ws.sessionId,
+        text: packet.text,
+      });
+    },
+
+    async typing(ws) {
+      if (ws.state !== "chatting") return;
+      // Ephemeral: relayed to the partner, never persisted.
+      await publisher.publish(
+        ws.currentRoom,
+        JSON.stringify({ kind: "typing", from: ws.sessionId }),
+      );
+    },
+  };
+
   wss.on("connection", (ws) => {
     // Identity is decided by the server, never by the client. A client-chosen
     // id could be set to someone else's id to hijack their match.
-    const myUserId = randomUUID();
-    ws.sessionId = myUserId;
-    localUsers.set(myUserId, ws);
+    ws.sessionId = randomUUID();
+    ws.state = "idle"; // idle -> searching -> chatting -> idle
+    ws.currentRoom = null;
+    ws.partnerId = null;
+    localUsers.set(ws.sessionId, ws);
+
     const allowPacket = createRateLimiter(
       config.RATE_LIMIT_MAX,
       config.RATE_LIMIT_WINDOW_MS,
@@ -122,62 +286,8 @@ async function startServer() {
 
         const parsed = parsePacket(rawData);
         if (!parsed.ok) return sendError(ws, parsed.error);
-        const packet = parsed.packet;
 
-        if (packet.action === "find_match") {
-          if (ws.currentRoom && localRooms.has(ws.currentRoom)) {
-            const oldRoomSet = localRooms.get(ws.currentRoom);
-            oldRoomSet.delete(ws);
-
-            if (oldRoomSet.size === 0) {
-              localRooms.delete(ws.currentRoom);
-              await subscriber.unsubscribe(ws.currentRoom);
-              console.log(` unsubscribed from abandoned room: ${ws.currentRoom}`);
-            }
-
-            ws.currentRoom = null;
-          }
-
-          sendJson(ws, {
-            system: true,
-            action: "searching",
-            text: `Searching for a stranger`,
-          });
-
-          try {
-            const response = await fetch(MATCHMAKER_URL, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ userId: myUserId, serverId: SERVER_ID }),
-              signal: AbortSignal.timeout(config.MATCHMAKER_TIMEOUT_MS),
-            });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-          } catch (err) {
-            console.error("failed to contact Matchmaker API:", err.message);
-            // We might already be queued; don't leave a half-registered user behind.
-            await publisher.zRem("waiting_pool", myUserId).catch(() => {});
-            sendError(ws, "Matchmaking is unavailable right now. Try again.");
-          }
-        }
-
-        if (packet.action === "send") {
-          if (!ws.currentRoom) return sendError(ws, "You are not in a chat.");
-
-          await publisher.publish(
-            ws.currentRoom,
-            JSON.stringify({
-              id: randomUUID(),
-              from: myUserId,
-              text: packet.text,
-              ts: Date.now(),
-            }),
-          );
-          await publisher.xAdd("chat_history_log", "*", {
-            roomId: ws.currentRoom,
-            userId: myUserId,
-            text: packet.text,
-          });
-        }
+        await handlers[parsed.packet.action](ws, parsed.packet);
       } catch (err) {
         console.error(` [${SERVER_ID}] Failed to handle packet:`, err);
         sendError(ws, "Something went wrong on our side.");
@@ -185,34 +295,16 @@ async function startServer() {
     });
 
     ws.on("close", async () => {
-      console.log(` [${SERVER_ID}] ${myUserId} disconnected.`);
+      console.log(` [${SERVER_ID}] ${ws.sessionId} disconnected.`);
+      localUsers.delete(ws.sessionId);
 
       try {
-        localUsers.delete(myUserId);
-        await publisher.del(`route:${myUserId}`);
+        const wasSearching = ws.state === "searching";
+        ws.state = "closed";
+        await publisher.del(`route:${ws.sessionId}`);
 
-        if (!ws.currentRoom) {
-          await publisher.zRem("waiting_pool", myUserId);
-        } else {
-          await publisher.publish(
-            ws.currentRoom,
-            JSON.stringify({
-              system: true,
-              action: "partner_left",
-              text: "Stranger has disconnected.",
-            }),
-          );
-
-          if (localRooms.has(ws.currentRoom)) {
-            const roomSet = localRooms.get(ws.currentRoom);
-            roomSet.delete(ws);
-            if (roomSet.size === 0) {
-              localRooms.delete(ws.currentRoom);
-              await subscriber.unsubscribe(ws.currentRoom);
-              console.log(` unsubscribed from dead room: ${ws.currentRoom}`);
-            }
-          }
-        }
+        if (wasSearching) await publisher.zRem(WAITING_POOL, ws.sessionId);
+        if (ws.currentRoom) await leaveRoom(ws);
       } catch (err) {
         console.error(` [${SERVER_ID}] Cleanup failed:`, err);
       }

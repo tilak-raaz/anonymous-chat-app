@@ -2,7 +2,13 @@
 // Anything a client sends is untrusted: never let it throw inside a handler.
 const { MAX_MESSAGE_LENGTH } = require("./config");
 
-const ACTIONS = new Set(["find_match", "send"]);
+const ACTIONS = new Set([
+  "find_match",
+  "cancel_search",
+  "leave",
+  "send",
+  "typing",
+]);
 
 /**
  * Returns { ok: true, packet } or { ok: false, error }.
