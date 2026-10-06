@@ -1,12 +1,13 @@
 const express = require("express");
 const { createClient } = require("redis");
+const config = require("./config");
 
 const app = express();
-const PORT = 3001;
+const PORT = config.MATCHMAKER_PORT;
 
 app.use(express.json());
 
-const redis = createClient({ url: "redis://redis:6379" });
+const redis = createClient({ url: config.REDIS_URL });
 
 redis.on("error", (err) => console.error("Redis Client Error:", err));
 
@@ -14,7 +15,10 @@ async function startMatchmaker() {
   await redis.connect();
 
   app.post("/find-match", async (req, res) => {
-    const { userId, serverId } = req.body;
+    const { userId, serverId } = req.body || {};
+    if (typeof userId !== "string" || typeof serverId !== "string") {
+      return res.status(400).json({ error: "userId and serverId are required" });
+    }
     res.status(200).json({ status: "processing" });
 
     try {
@@ -64,4 +68,7 @@ async function startMatchmaker() {
     console.log(`🚀 Matchmaker API is running on http://localhost:${PORT}`);
   });
 }
-startMatchmaker();
+startMatchmaker().catch((err) => {
+  console.error("Failed to start matchmaker:", err);
+  process.exit(1);
+});

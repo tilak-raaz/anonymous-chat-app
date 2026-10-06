@@ -1,7 +1,9 @@
 const { createClient } = require("redis");
 
 async function nukeRedis() {
-  const client = createClient({ url: "redis://localhost:6379" });
+  const client = createClient({
+    url: process.env.REDIS_URL || "redis://localhost:6379",
+  });
 
   await client.connect();
 

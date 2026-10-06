@@ -1,17 +1,14 @@
 const { createClient } = require("redis");
 const { Pool } = require("pg");
+const config = require("./config");
 
 // PostgreSQL Connection Pool
-const pgPool = new Pool({
-  host: process.env.DB_HOST || "postgres",
-  port: 5432,
-  user: process.env.DB_USER || "postgres",
-  password: process.env.DB_PASSWORD || "postgres",
-  database: process.env.DB_NAME || "anonymous_db",
-});
+const pgPool = new Pool(config.DB);
+pgPool.on("error", (err) => console.error("Postgres pool error:", err.message));
 
 // Redis Connection
-const redis = createClient({ url: "redis://redis:6379" });
+const redis = createClient({ url: config.REDIS_URL });
+redis.on("error", (err) => console.error("Redis Client Error:", err));
 
 const STREAM_KEY = "chat_history_log";
 const GROUP_NAME = "db_writers";
@@ -68,4 +65,7 @@ async function startWorker() {
   }
 }
 
-startWorker();
+startWorker().catch((err) => {
+  console.error("Failed to start worker:", err);
+  process.exit(1);
+});
